@@ -984,12 +984,70 @@ def tmux(*args, input_text=None):
     return subprocess.run(["tmux", *args], input=input_text, text=True, capture_output=True, timeout=15)
 
 
-def screen(lines=120):
-    result = tmux("capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", SESSION)
+def screen(lines=120, target=None):
+    """Capture the content of a tmux pane/window.
+
+    *target* is a tmux target specifier (e.g. "web:1", "web:1.0").
+    If None, defaults to the configured SESSION.
+    """
+    target = target or SESSION
+    result = tmux("capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", target)
     if result.returncode:
         return "tmux session is unavailable: " + result.stderr.strip()
     output = result.stdout.strip() or "(terminal is blank)"
     return output[-3800:]
+
+
+def list_tmux_windows(session=None):
+    """Return a list of windows in a tmux session.
+
+    Each entry is a dict with 'index' (int) and 'name' (str).
+    Returns an empty list if the session is unavailable.
+    """
+    target = session or SESSION
+    result = tmux("list-windows", "-t", target, "-F",
+                  "#{window_index}:#{window_name}")
+    if result.returncode:
+        return []
+    windows = []
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if ":" in line:
+            idx, name = line.split(":", 1)
+            windows.append({"index": int(idx), "name": name})
+    return windows
+
+
+def list_tmux_panes(window_target=None):
+    """Return a list of panes in a tmux window.
+
+    Each entry is a dict with 'index' (int) and 'title' (str).
+    *window_target* is like "session:window" (e.g. "web:1").
+    Defaults to the current session's active window.
+    Returns an empty list if unavailable.
+    """
+    target = window_target or SESSION
+    # Use a pipe as a separator because tmux format variables should never
+    # contain a pipe character. If the pane has no title, show its index.
+    result = tmux("list-panes", "-t", target, "-F",
+                  "#{pane_index}|#{pane_title}")
+    if result.returncode:
+        return []
+    panes = []
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if "|" in line:
+            idx, title = line.split("|", 1)
+            panes.append({"index": int(idx), "title": title})
+    return panes
+
+
+def list_tmux_sessions():
+    """Return a list of available tmux session names."""
+    result = tmux("list-sessions", "-F", "#{session_name}")
+    if result.returncode:
+        return []
+    return [s.strip() for s in result.stdout.strip().splitlines() if s.strip()]
 
 
 def delayed_screen(chat_id):
@@ -1562,7 +1620,69 @@ def handle(message, state, update=None):
         else:
             reply(chat_id, "Usage: /task <prompt>")
     elif command == "/screen":
-        reply(chat_id, screen())
+        # Build a list of available tmux screens (sessions, windows, panes)
+        # and present them as inline buttons. Tapping a button shows the
+        # captured content of that target.
+        screens = []
+
+        # 1. If there are multiple tmux sessions, list each as a top-level
+        #    screen option (capturing the whole session shows the active pane).
+        sessions = list_tmux_sessions()
+        if len(sessions) > 1:
+            for s in sessions:
+                screens.append({
+                    "target": s,
+                    "label": f"🖥️ Session: {s}",
+                })
+            # Still show windows from the default session below.
+        # 2. List windows from the primary session.
+        windows = list_tmux_windows()
+        for w in windows:
+            target = f"{SESSION}:{w['index']}"
+            # Check if this window has more than one pane.
+            panes = list_tmux_panes(target)
+            if len(panes) > 1:
+                # Show each pane as a separate screen option.
+                for p in panes:
+                    pane_target = f"{target}.{p['index']}"
+                    label = f"📟 {SESSION}:{w['index']}.{p['index']}"
+                    if p.get('title'):
+                        label += f" {p['title']}"
+                    screens.append({
+                        "target": pane_target,
+                        "label": label,
+                    })
+            else:
+                # Single-pane window: show as one option.
+                label = f"📟 {SESSION}:{w['index']}"
+                if w.get('name'):
+                    label += f" {w['name']}"
+                screens.append({
+                    "target": target,
+                    "label": label,
+                })
+        if not screens:
+            # Fallback: just show the current screen content.
+            reply(chat_id, screen())
+        else:
+            rows = []
+            for s in screens:
+                rows.append([{
+                    "text": s["label"],
+                    "callback_data": f"/screen_show {s['target']}",
+                }])
+            reply_with_buttons(
+                chat_id,
+                "📺 *Select a screen to view:*",
+                rows,
+            )
+    elif command.startswith("/screen_show"):
+        target = command[len("/screen_show"):].strip()
+        if target:
+            reply(chat_id, screen(target=target))
+        else:
+            # Bare /screen_show without a target: show the current/default screen.
+            reply(chat_id, screen())
     elif command == "/status":
         counts = TASKS.counts()
         pending = sum(counts.get(s, 0) for s in ('queued', 'running', 'cancelling', 'paused', 'interrupted'))
