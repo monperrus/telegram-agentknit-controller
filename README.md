@@ -30,7 +30,10 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
 - **Rolling context window**: `fresh_session=False`, `max_context_turns=5`
   (the last 5 exchanges are kept as context).
 - **Immediate acknowledgment** via a reaction (`setMessageReaction`, 🫡 then 👍
-  as fallback, then the text `🫡` as a last resort).
+  as fallback, then the text `🫡` as a last resort via `acknowledge()`).
+- **`change_summary(change)`**: formats a file change notification as
+  `✏️ Changed\n<basename>  +<added> -<removed>` (or without line counts
+  when unavailable). Reported per unique path per turn only once.
 - **Typing indicator** (`sendChatAction` typing) sent on receipt, then refreshed
   every 4 s and on every tool call.
 - **File-change detection** from `tool_result` events of the `write_file`,
@@ -40,8 +43,14 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   `OK: wrote N bytes to /path` / `OK: replaced ... in /path`.
 - **Cooperative cancellation** via `agentknit.CancelToken` with a per-turn
   timer (`TURN_TIMEOUT`, 180 s default); the agent reacts to interruption.
-- **Friendly error messages**: raw agentknit/HTTP errors (429 rate limits, API
-  errors, binary exits) are translated into concise Telegram-friendly text.
+- **Friendly error messages** via `_friendly_agent_error()`: raw agentknit/HTTP
+  errors are translated into concise Telegram-friendly text. Recognized errors:
+  - HTTP 429 / rate limits / `FreeUsageLimitError` → *"The model's free-usage
+    rate limit was hit (HTTP 429). No reply was produced — please try again
+    later."*
+  - Subprocess binary exits (e.g. `Binary '…' exited N: …`) → stripped of the
+    noisy prefix, keeping only the underlying message.
+  - All other errors → the raw message text (or *"Agent request failed."*).
 
 ### 3. Durable tasks (`/task`) — SQLite queue
 
@@ -50,9 +59,18 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   (isolated, accumulated context).
 - **`/tasks`**: lists the 6 most recent tasks as inline buttons (status icon +
   `T-<id>`, status, human-readable duration).
-- **`/task detail <id>`**: detailed view (status, agent, runtime, age, input/
-  output tokens, turns, tool calls, prompt snippet, latest message/checkpoint,
-  error) with contextual buttons (Interrupt / Resume).
+- **`/task detail <id>`**: detailed view showing:
+  - Status (with status icon), agent name, runtime duration, total age
+  - Token usage: input tokens, output tokens, total
+  - Turns and tool calls count
+  - Request prompt snippet (first 800 characters)
+  - Latest message/checkpoint (last 1500 characters)
+  - Error message if any (last 1000 characters)
+  - Contextual inline buttons: Interrupt (for running tasks) or Resume
+    (for completed/failed/cancelled/paused/interrupted tasks).
+- Durations are formatted as human-readable strings by `human_duration()`:
+  seconds → `Xs`, minutes → `Xm Ys` or `Xm`, hours → `Xh Ym` or `Xh`,
+  days → `Xd Yh` or `Xd`, months → `Xmo Yd` or `Xmo`.
 - **`/task pause <id>`**: pauses a `queued` task.
 - **`/task resume <id> [new prompt]`**: resumes a
   `paused`/`interrupted`/`failed`/`completed`/`cancelled` task, optionally with
@@ -94,18 +112,34 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
 - Choice **persisted** in controller state and restored on restart.
 - **Per-task pinned agent**: changing the active agent mid-run does not affect
   a task already queued or running.
-- Runtimes are built and cached lazily; the active agent is **pre-warmed** at
-  startup (non-fatal on failure, so another agent can be selected via `/agent`).
+- Runtimes are built and cached lazily (`RUNTIMES` pool); the active agent is
+  **pre-warmed** at startup (non-fatal on failure, so another agent can be
+  selected via `/agent`).
+- **Dual runtime isolation**: the interactive lane and the `TaskWorker` lane
+  each use their own private runtime cache (`RUNTIMES` vs `self._runtimes`), so
+  a long-running task session never collides with interactive requests.
+- **Per-task session persistence**: each task saves a deep copy of its
+  agentknit session after every progress update, enabling full conversation
+  history on resume via `init_session(session=...)`.
 
 ### 5. tmux integration
 
 - **`/tmux <text>`**: types the text + Enter into the configured tmux session,
   then a delayed screen capture (20 s, 30 lines) without blocking polling.
-- **`/screen`**: recent output of the tmux session (120 lines, truncated to
-  3800 characters).
+- **`/screen`**: lists available tmux screens as inline buttons — sessions,
+  windows, and individual panes. Tapping a button captures and returns that
+  screen's content (120 lines, truncated to 3800 characters). When only one
+  session/window exists, the content is returned directly without a menu.
+- **`/screen_show <target>`**: invoked by the inline buttons (or usable
+  directly) to capture a specific tmux target (e.g. `web:1`, `web:1.0`).
+  Uses the same screen capture logic as `/screen`.
 - **`/status`**: tmux session presence, active agent + number configured, and
   task counts (pending, completed, failed, cancelled, total).
 - **`/interrupt`**: sends `Ctrl-C` to the tmux session.
+- Helper functions used by the screen picker:
+  - `list_tmux_sessions()` — enumerates all available tmux sessions.
+  - `list_tmux_windows(session=None)` — lists windows within a session.
+  - `list_tmux_panes(window_target=None)` — lists panes within a window.
 
 ### 6. System and miscellaneous commands
 
@@ -138,11 +172,24 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   variables for non-interactive install.
 - Files installed to `~/.local/share/telegram-agentknit-controller`; secrets in
   `~/.config/telegram-agentknit-control.env`.
-- **`--check`**: validates the install without entering the polling loop (config
-  file permissions, agentknit importability, agent registry, tmux, workspace,
-  tmux session, Telegram bot).
+- **`telegram-agentknit-control.env.example`**: a documented example config file
+  with all optional `TELEGRAM_AGENTKNIT_*` variables commented out.
+- **`--check`**: validates the install without entering the polling loop.
+  Checks performed:
+  - Config file permissions (must be mode 600).
+  - `agentknit` Python package import and version.
+  - Agent registry configuration (spec files exist or model+endpoint set).
+  - `tmux` binary availability on `PATH`.
+  - Workspace directory existence.
+  - tmux session availability (warning, not fatal).
+  - Telegram bot API connectivity (`getMe`).
 - `loginctl enable-linger` for persistence after logout/reboot.
-- systemd examples provided (user service and an adaptable system service).
+- systemd examples provided:
+  - **User service** (`systemd/telegram-agentknit-controller.user.service`):
+    installed by `install.sh`, runs as the current user via `systemctl --user`.
+  - **System service** (`systemd/telegram-agentknit-controller.service.example`):
+    adaptable template for system-wide installation (requires editing
+    `YOUR_USER` and paths).
 
 ### 9. Configuration (environment variables)
 
