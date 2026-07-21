@@ -1,0 +1,25 @@
+[Unit]
+Description=Private Telegram tmux/agentknit controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/telegram-agentknit-control.env
+Environment=TELEGRAM_AGENTKNIT_CONFIG=%h/.config/telegram-agentknit-control.env
+Environment=TELEGRAM_AGENTKNIT_STATE=%h/.local/state/telegram-agentknit-control.json
+Environment=TELEGRAM_AGENTKNIT_TMUX_SESSION=web
+Environment=TELEGRAM_AGENTKNIT_WORKSPACE=%h
+Environment=TZ=Europe/Paris
+# Point to your agent spec or model+endpoint:
+# Environment=TELEGRAM_AGENTKNIT_SPEC=%h/.local/share/telegram-agentknit-controller/agent_spec.json
+# Environment=TELEGRAM_AGENTKNIT_MODEL=deepseek-v4-flash-free
+# Environment=TELEGRAM_AGENTKNIT_ENDPOINT=run:///home/user/bin/agent-binary.py
+ExecStart=%h/.local/share/telegram-agentknit-controller/telegram-agentknit-control.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
