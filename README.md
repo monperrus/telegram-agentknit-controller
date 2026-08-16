@@ -1,11 +1,9 @@
 # Telegram Agentknit Controller
 
 A private, single-user Telegram bot that drives an agentknit-powered coding
-agent (e.g. `agent-deepseek-v4-flash-zen`) instead of a Codex app-server. It
-can also type text into a named tmux session. It is designed for a machine you
-control: it is **not** a hardened multi-user bot or a public service.
-
-Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-codex-controller).
+agent (e.g. `agent-deepseek-v4-flash-zen`). It can also type text into a named
+tmux session. It is designed for a machine you control: it is **not** a
+hardened multi-user bot or a public service.
 
 ---
 
