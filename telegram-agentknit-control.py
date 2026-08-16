@@ -23,6 +23,10 @@ STATE_PATH = os.environ.get("TELEGRAM_AGENTKNIT_STATE",
 SESSION = os.environ.get("TELEGRAM_AGENTKNIT_TMUX_SESSION", "web")
 WORKSPACE = os.environ.get("TELEGRAM_AGENTKNIT_WORKSPACE", HOME)
 AGENT_SPEC = os.environ.get("TELEGRAM_AGENTKNIT_SPEC", "")
+# Optional default project (an absolute path, or a folder name under $HOME)
+# selected at startup. A project is a working directory for the agent: a folder
+# under $HOME that is a git repository with at least one configured remote.
+DEFAULT_PROJECT = os.environ.get("TELEGRAM_AGENTKNIT_PROJECT", "")
 AGENTKNIT_MODEL = os.environ.get("TELEGRAM_AGENTKNIT_MODEL", "")
 AGENTKNIT_ENDPOINT = os.environ.get("TELEGRAM_AGENTKNIT_ENDPOINT", "")
 SYSTEM_PROMPT_SUPPLEMENT = os.environ.get("TELEGRAM_AGENTKNIT_SYSTEM_PROMPT_SUPPLEMENT", "")
@@ -49,6 +53,20 @@ AGENT_ORDER = []       # insertion order of agent keys (stable listings)
 ACTIVE_AGENT = ""      # currently selected agent key
 RUNTIMES = {}          # key -> AgentknitRuntime (lazily built & cached)
 RUNTIMES_LOCK = threading.Lock()
+# Direct Telegram messages share a single Agentknit session.  They must be
+# processed end-to-end in arrival order; locking only run_turn() leaves a race
+# in session preparation and event-handler registration.
+INTERACTIVE_REQUEST_LOCK = threading.Lock()
+
+# ── Project registry ─────────────────────────────────────────────────────────
+# A "project" is a folder under $HOME that is a git repository with at least one
+# configured remote. Each project is a candidate working directory for the agent
+# (the agent's tools run with that project as their cwd). The active project is
+# selectable at runtime via /projects and persisted in the controller state.
+#
+# ACTIVE_PROJECT is an absolute path (the selected project's cwd) or "" when no
+# project is selected — in that case the agent uses WORKSPACE ($HOME by default).
+ACTIVE_PROJECT = ""    # currently selected project path (absolute), or ""
 
 
 def config():
@@ -580,6 +598,224 @@ def get_agent_runtime(agent_key=None, cache=None):
         return runtime
 
 
+# ── Projects ─────────────────────────────────────────────────────────────────
+# A "project" is a folder under $HOME that is a git repository with at least one
+# configured remote. Selecting a project makes it the agent's working directory
+# (cwd): the agent's tools (file reads/writes, shell commands) run with that
+# directory as their cwd, and the project's AGENTS.md (if any) is picked up by
+# the session's system prompt. The choice is persisted across restarts.
+
+PROJECTS_LOCK = threading.Lock()
+
+
+def _repo_toplevel(path):
+    """Return the absolute git work-tree root containing *path*, or None.
+
+    Uses git's own notion of the work-tree top level so that a directory that
+    merely sits *inside* a larger repo (e.g. every subdirectory of a repo at /)
+    is not mistaken for a repo of its own.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        top = result.stdout.strip()
+        return os.path.abspath(top) if top else None
+    except Exception:
+        return None
+
+
+def _git_remote(path):
+    """Return the first fetch remote URL for a git repo at *path*, else None."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            url = result.stdout.strip()
+            if url:
+                return url
+        # Fall back to enumerating all remotes (origin might be named otherwise).
+        result = subprocess.run(
+            ["git", "-C", path, "remote", "-v"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            # "origin\thttps://...\t(fetch)"
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[-1].endswith("(fetch)"):
+                return parts[1].rsplit("\t", 1)[-1].split()[0]
+    except Exception:
+        pass
+    return None
+
+
+def _is_git_project(path):
+    """True if *path* is itself a git work-tree root with at least one remote.
+
+    A folder that merely lives *inside* another repo does not count — *path*
+    must be the repo's top level (so e.g. subdirectories of a repo at / are
+    not mistaken for projects).
+    """
+    if not os.path.isdir(path):
+        return False
+    if _repo_toplevel(path) != os.path.abspath(path):
+        return False
+    return _git_remote(path) is not None
+
+
+def discover_projects():
+    """Return a list of known projects (folders under $HOME that are git repos).
+
+    Each entry is a dict: {"name": <basename>, "path": <abs path>,
+    "remote": <remote url>}. The list is sorted by name and includes the current
+    working directory's project if applicable. Discovery scans the immediate
+    subdirectories of $HOME (shallow); nested repos are not enumerated.
+    """
+    projects = []
+    seen = set()
+    candidates = [HOME]
+    try:
+        for entry in os.listdir(HOME):
+            candidates.append(os.path.join(HOME, entry))
+    except OSError:
+        pass
+    for path in candidates:
+        if path in seen:
+            continue
+        if not os.path.isdir(path):
+            continue
+        # Only count a folder as a project if it is *itself* a git work-tree
+        # root with a remote (so subdirectories of a larger repo are skipped).
+        if not _is_git_project(path):
+            continue
+        remote = _git_remote(path)
+        if remote:
+            seen.add(path)
+            projects.append({
+                "name": os.path.basename(path) or path,
+                "path": os.path.abspath(path),
+                "remote": remote,
+            })
+    projects.sort(key=lambda p: p["name"].lower())
+    return projects
+
+
+def project_cwd():
+    """The directory the agent should run in: the active project or WORKSPACE."""
+    return ACTIVE_PROJECT or WORKSPACE
+
+
+def active_project_name():
+    """Human-readable name for the active project, or '' when none is set."""
+    if ACTIVE_PROJECT:
+        return os.path.basename(ACTIVE_PROJECT) or ACTIVE_PROJECT
+    return ""
+
+
+def _apply_project_cwd():
+    """chdir into the active project (or WORKSPACE) so the agent's tools inherit it."""
+    target = project_cwd()
+    try:
+        os.chdir(target)
+    except OSError as error:
+        print(f"telegram-agentknit-control: cannot chdir to project '{target}': "
+              f"{error}", file=sys.stderr, flush=True)
+
+
+def _reset_interactive_sessions():
+    """Drop cached interactive runtimes so sessions rebuild in the new cwd.
+
+    Selecting a different project changes the cwd (and thus the project's
+    AGENTS.md picked up by init_session), so previously-built interactive
+    sessions are discarded. Per-task sessions in the TaskWorker are left
+    untouched (tasks are pinned to their creation-time project implicitly).
+    """
+    with RUNTIMES_LOCK:
+        # Stop and forget interactive runtimes; they are lazily rebuilt on use.
+        for runtime in list(RUNTIMES.values()):
+            try:
+                runtime.stop()
+            except Exception:
+                pass
+        RUNTIMES.clear()
+
+
+def set_active_project(path, state):
+    """Select a project by absolute path and apply it as the agent's cwd.
+
+    *path* may be absolute, relative to HOME, or just a folder name under HOME.
+    Returns True on success, False if *path* is not a valid git project.
+    """
+    global ACTIVE_PROJECT
+    with PROJECTS_LOCK:
+        if path.startswith("~/"):
+            path = os.path.join(HOME, path[2:])
+        if not os.path.isabs(path):
+            # Try as a folder name under HOME first, then relative to cwd.
+            under_home = os.path.join(HOME, path)
+            if os.path.isdir(under_home):
+                path = under_home
+            else:
+                path = os.path.abspath(path)
+        if not _is_git_project(path):
+            return False
+        ACTIVE_PROJECT = os.path.abspath(path)
+        state["project"] = ACTIVE_PROJECT
+        write_state(state)
+        _apply_project_cwd()
+        _reset_interactive_sessions()
+        return True
+
+
+def handle_projects_command(chat_id, message_id, command, state):
+    """Implement /projects [list|<name>|<path>|none].
+
+    With no argument (or /projects list) show the discovered projects as inline
+    buttons (the active one is marked 🟢). With a name/path, switch to it.
+    Use `/projects none` to clear the selection and fall back to WORKSPACE.
+    """
+    argument = command[len("/projects"):].strip()
+    if argument.lower() in ("none", "off", "clear"):
+        global ACTIVE_PROJECT
+        ACTIVE_PROJECT = ""
+        state.pop("project", None)
+        write_state(state)
+        _apply_project_cwd()
+        _reset_interactive_sessions()
+        reply(chat_id, f"📂 No project selected. Using workspace: `{project_cwd()}`")
+        return
+    if argument.lower() in ("", "list"):
+        projects = discover_projects()
+        if not projects:
+            reply(chat_id, "No projects found. A project is a git repository "
+                           "(with a remote) under $HOME.")
+            return
+        rows = []
+        for p in projects:
+            mark = "🟢 " if p["path"] == ACTIVE_PROJECT else ""
+            rows.append([{
+                "text": f"{mark}{p['name']}",
+                "callback_data": f"/projects {p['path']}",
+            }])
+        active = active_project_name()
+        header = ("📂 *Select a project* — it becomes the agent's cwd.\n\n"
+                  f"Active: *{active or '(workspace)'}* (`{project_cwd()}`)")
+        reply_with_buttons(chat_id, header, rows)
+        return
+    # Otherwise treat the argument as a project name/path to select.
+    if set_active_project(argument, state):
+        reply(chat_id, f"🟢 Active project: *{active_project_name()}*\n"
+                       f"cwd: `{project_cwd()}`")
+    else:
+        reply(chat_id, f"Not a git project with a remote: {argument}\n"
+                       f"Use /projects to list available projects.")
+
+
 class TelegramApi:
     """Small keep-alive Telegram client; one instance per request lane."""
 
@@ -701,6 +937,7 @@ class TaskStore:
                 ('turns', 'INTEGER NOT NULL DEFAULT 0'),
                 ('tool_calls', 'INTEGER NOT NULL DEFAULT 0'),
                 ('agent', 'TEXT NOT NULL DEFAULT ""'),
+                ('project', 'TEXT NOT NULL DEFAULT ""'),
             ):
                 try:
                     self.connection.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
@@ -711,13 +948,13 @@ class TaskStore:
     def _row(self, row):
         return dict(row) if row else None
 
-    def create(self, chat_id, prompt, agent=None):
+    def create(self, chat_id, prompt, agent=None, project=None):
         now = int(time.time())
         with self.lock, self.connection:
             queued = self.connection.execute("SELECT count(*) FROM tasks WHERE status IN ('queued', 'running', 'cancelling')").fetchone()[0]
             if queued >= TASK_MAX_QUEUE:
                 raise RuntimeError(f"task queue is full ({TASK_MAX_QUEUE})")
-            cursor = self.connection.execute("INSERT INTO tasks (chat_id, prompt, status, agent, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?)", (str(chat_id), prompt, agent or "", now, now))
+            cursor = self.connection.execute("INSERT INTO tasks (chat_id, prompt, status, agent, project, created_at, updated_at) VALUES (?, ?, 'queued', ?, ?, ?, ?)", (str(chat_id), prompt, agent or "", project or "", now, now))
             return self.get(cursor.lastrowid)
 
     def get(self, task_id):
@@ -861,6 +1098,19 @@ class TaskWorker:
                 self.store.finish(task_id, 'failed', error='Agentknit runtime is not available.')
                 reply(chat_id, f"Task T-{task_id} failed: Agentknit runtime is not available.\nUse /agent to select a configured agent and restart.")
                 continue
+            # Run the task in its pinned project's cwd (persisted at creation
+            # time) if one was recorded, otherwise the active project/workspace.
+            # This pins a task to the project selected when it was queued so a
+            # later /projects switch never moves a running task's files.
+            task_project = task.get('project') or ACTIVE_PROJECT or ""
+            if task_project and os.path.isdir(task_project):
+                try:
+                    os.chdir(task_project)
+                except OSError as error:
+                    print(f"telegram-agentknit-control: task T-{task_id} cannot "
+                          f"chdir to '{task_project}': {error}", file=sys.stderr, flush=True)
+            else:
+                _apply_project_cwd()
             # typing_stop is always defined before try so the except/finally blocks
             # are safe even if send_typing raises.
             typing_stop = threading.Event()
@@ -1070,16 +1320,27 @@ def change_summary(change):
 
 
 def run_remote_control(chat_id, prompt):
+    """Process one direct request without racing the shared chat session."""
+    with INTERACTIVE_REQUEST_LOCK:
+        _run_remote_control(chat_id, prompt)
+
+
+def _run_remote_control(chat_id, prompt):
     """Run a Telegram request using the active agent's AgentknitRuntime instance.
 
     General conversation uses a rolling context window of the last 5 messages
     (fresh_session=False, max_context_turns=5) so the agent has a bit of
     conversation history without accumulating indefinitely.
+
+    Runs in the active project's cwd (see /projects) so the agent's tools and
+    the project's AGENTS.md apply to this request.
     """
     runtime = get_agent_runtime()
     if runtime is None:
         reply(chat_id, "No agent runtime is available. Use /agent to select a configured agent and restart.")
         return
+    # Ensure the agent runs in the active project's cwd (selected via /projects).
+    _apply_project_cwd()
     # typing_stop is always defined before try so the finally block is safe.
     typing_stop = threading.Event()
     try:
@@ -1318,6 +1579,11 @@ def task_detail_text(task):
     if task_agent:
         lines.append(f"Agent: *{agent_label(task_agent)}*")
 
+    # Project the task is pinned to (if any).
+    task_project = task.get('project') or ''
+    if task_project:
+        lines.append(f"Project: *{os.path.basename(task_project) or task_project}* (`{task_project}`)")
+
     # Time stats.
     created = task.get('created_at', 0)
     started = task.get('started_at')
@@ -1378,10 +1644,16 @@ def start_task(chat_id, message_id, prompt):
     try:
         # Persist the currently active agent on the task so the worker uses
         # the same model for the lifetime of the task even if the user later
-        # switches agents for interactive requests.
-        task = TASKS.create(chat_id, prompt, agent=ACTIVE_AGENT or None)
+        # switches agents for interactive requests. Persist the active project
+        # too so the task always runs in the project that was selected at
+        # creation time.
+        task = TASKS.create(chat_id, prompt,
+                            agent=ACTIVE_AGENT or None,
+                            project=ACTIVE_PROJECT or None)
         TASK_WORKER.notify()
-        reply(chat_id, f"Task T-{task['id']} queued ({ACTIVE_AGENT}). Use /task detail {task['id']} to follow it.")
+        proj = active_project_name()
+        proj_tag = f", project {proj}" if proj else ""
+        reply(chat_id, f"Task T-{task['id']} queued ({ACTIVE_AGENT}{proj_tag}). Use /task detail {task['id']} to follow it.")
     except Exception as error:
         reply(chat_id, f"Unable to queue task: {error}")
 
@@ -1433,6 +1705,7 @@ SHORTCUTS = {
     "m": ("/tmux", "/tmux"),    # `m <text>` types into tmux
     "x": ("/sh", "/sh"),        # `x <cmd>` runs a shell command
     "c": ("/rc", "/rc"),        # `c <prompt>` is the same as bare text -> agent
+    "p": ("/projects", "/projects"),  # bare lists projects; `p <name>` selects one
 }
 
 
@@ -1476,7 +1749,7 @@ def handle(message, state, update=None):
                  {"text": "📺 Screen", "callback_data": "/screen"}],
                 [{"text": "📋 Tasks", "callback_data": "/tasks"},
                  {"text": "🤖 Agent", "callback_data": "/agent"}],
-                [{"text": "🔄 Restart", "callback_data": "/restart"},
+                [{"text": "📂 Projects", "callback_data": "/projects"},
                  {"text": "❓ Help", "callback_data": "/help"}],
             ])
         else:
@@ -1485,12 +1758,12 @@ def handle(message, state, update=None):
     if not permitted(chat_id, state):
         return
     if command in ("/start", "/help"):
-        reply_with_buttons(chat_id, "🤖 *Telegram Agentknit Controller*\n\nSend text directly for an agentknit request, or use the buttons below.\n\n*One-letter shortcuts* (type the letter alone, or `letter <args>`):\n`h` help · `s` status · `v` view screen · `i` interrupt · `r` restart\n`t` list tasks / `t <prompt>` new task · `a` agents / `a <key>` select\n`m <text>` type in tmux · `x <cmd>` run shell · `c <prompt>` ask agent", [
+        reply_with_buttons(chat_id, "🤖 *Telegram Agentknit Controller*\n\nSend text directly for an agentknit request, or use the buttons below.\n\n*One-letter shortcuts* (type the letter alone, or `letter <args>`):\n`h` help · `s` status · `v` view screen · `i` interrupt · `r` restart\n`t` list tasks / `t <prompt>` new task · `a` agents / `a <key>` select\n`p` projects / `p <name>` select project · `m <text>` type in tmux\n`x <cmd>` run shell · `c <prompt>` ask agent", [
             [{"text": "🔍 Status", "callback_data": "/status"},
              {"text": "📺 Screen", "callback_data": "/screen"}],
             [{"text": "📋 Tasks", "callback_data": "/tasks"},
              {"text": "🤖 Agent", "callback_data": "/agent"}],
-            [{"text": "🔄 Restart", "callback_data": "/restart"},
+            [{"text": "📂 Projects", "callback_data": "/projects"},
              {"text": "❓ Help", "callback_data": "/help"}],
         ])
     elif command == "/tasks":
@@ -1690,10 +1963,12 @@ def handle(message, state, update=None):
         failed = counts.get('failed', 0)
         cancelled = counts.get('cancelled', 0)
         tmux_ok = tmux("has-session", "-t", SESSION).returncode == 0
+        proj_name = active_project_name()
         lines = [
             f"📊 *Controller Status*",
             f"tmux session '{SESSION}': {'✅' if tmux_ok else '❌'}",
             f"Active agent: *{agent_label(ACTIVE_AGENT)}* ({len(AGENT_ORDER)} configured)",
+            f"Active project: *{proj_name or '(workspace)'}* (`{project_cwd()}`)",
             f"",
             f"*Tasks:*",
             f"  Pending: {pending}",
@@ -1733,7 +2008,7 @@ def handle(message, state, update=None):
             result = subprocess.run(
                 command[4:].strip(),
                 shell=True, capture_output=True, text=True, timeout=30,
-                cwd=WORKSPACE,
+                cwd=project_cwd(),
             )
             output = result.stdout or ""
             if result.stderr:
@@ -1754,6 +2029,8 @@ def handle(message, state, update=None):
             reply(chat_id, "Usage: /rc <prompt>")
     elif command == "/agent" or command.startswith("/agent "):
         handle_agent_command(chat_id, message.get("message_id"), command, state)
+    elif command == "/projects" or command.startswith("/projects "):
+        handle_projects_command(chat_id, message.get("message_id"), command, state)
     elif command.startswith("/"):
         reply(chat_id, "Unknown command. Use /help.")
     else:
@@ -1809,6 +2086,21 @@ def check_requirements():
     else:
         problems.append(f"workspace is not a directory: {WORKSPACE}")
 
+    # Report discovered projects and the active project selection, if any.
+    try:
+        projects = discover_projects()
+        print(f"OK: {len(projects)} project(s) found")
+        for p in projects[:20]:
+            mark = " (active)" if p["path"] == ACTIVE_PROJECT else ""
+            print(f"     - {p['name']}  [{p['remote']}]{mark}")
+        if ACTIVE_PROJECT:
+            if os.path.isdir(ACTIVE_PROJECT):
+                print(f"OK: active project: {ACTIVE_PROJECT}")
+            else:
+                problems.append(f"active project is not a directory: {ACTIVE_PROJECT}")
+    except Exception as error:
+        print(f"WARN: project discovery failed: {error}", file=sys.stderr)
+
     result = tmux("has-session", "-t", SESSION)
     if result.returncode:
         print(f"WARN: tmux session '{SESSION}' is unavailable", file=sys.stderr)
@@ -1829,7 +2121,7 @@ def check_requirements():
 
 
 def main():
-    global CFG, API_PREFIX, TASKS, TASK_WORKER, AGENT_SPEC, AGENTKNIT_MODEL, AGENTKNIT_ENDPOINT, SYSTEM_PROMPT_SUPPLEMENT, ACTIVE_AGENT
+    global CFG, API_PREFIX, TASKS, TASK_WORKER, AGENT_SPEC, AGENTKNIT_MODEL, AGENTKNIT_ENDPOINT, SYSTEM_PROMPT_SUPPLEMENT, ACTIVE_AGENT, ACTIVE_PROJECT
     try:
         CFG = config()
     except (OSError, RuntimeError) as error:
@@ -1860,6 +2152,19 @@ def main():
         ACTIVE_AGENT = saved_agent
     elif AGENT_ORDER:
         ACTIVE_AGENT = AGENT_ORDER[0]
+    # Restore the previously selected project (cwd) from state, falling back to
+    # the TELEGRAM_AGENTKNIT_PROJECT default. A persisted state value wins so
+    # /projects selections survive restarts.
+    candidate_project = ""
+    saved_project = state.get("project") if isinstance(state, dict) else None
+    if saved_project and _is_git_project(saved_project):
+        candidate_project = saved_project
+    elif DEFAULT_PROJECT:
+        if set_active_project(DEFAULT_PROJECT, state):
+            candidate_project = ACTIVE_PROJECT
+    if candidate_project:
+        ACTIVE_PROJECT = candidate_project
+        _apply_project_cwd()
     try:
         TASKS = TaskStore(TASK_STATE_PATH)
         TASK_WORKER = TaskWorker(TASKS)

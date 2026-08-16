@@ -79,8 +79,9 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   the agent mid-turn.
 - **`/task cancel <id>`**: requests cancellation (`queued`→`cancelled`
   immediately; `running`→`cancelling`, checked at each tool boundary).
-- **`/task resume_prompt <id>` / `/task resumex <id>`**: resume variants
-  triggered from inline buttons.
+- **`/task resume_prompt <id>`**: the Resume inline button. It only prints
+  the /task resume <id>  prompt to copy, so the owner stays in control
+  of when a task is actually re-queued (it never resumes directly).
 - **Persistent SQLite queue** (`TaskStore`):
   - Lifecycle: `queued → running → completed / failed / cancelled`
     (intermediate states `paused`, `interrupted`, `cancelling`).
@@ -122,7 +123,37 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   agentknit session after every progress update, enabling full conversation
   history on resume via `init_session(session=...)`.
 
-### 5. tmux integration
+### 5. Projects (`/projects`)
+
+A **project** is a folder under `$HOME` that is its own git repository (work-tree
+root) with at least one configured remote — i.e. a real working tree, not just a
+subdirectory of a larger repo. Selecting a project makes it the agent's working
+directory: the agent's tools (file reads/writes, `execute_shell_command`) run
+with that directory as their `cwd`, and the project's `AGENTS.md` (if present)
+is picked up by the session's system prompt.
+
+- **`/projects`** (`p` shortcut): discovers git projects under `$HOME` and lists
+  them as inline buttons (one per project; the active one is marked 🟢). Tapping
+  a button selects it. With no active project the agent runs in `WORKSPACE`
+  (`$HOME` by default).
+- **`/projects <name|path>`**: selects a project by folder name (relative to
+  `$HOME`), `~/path`, or absolute path. Only valid git projects with a remote
+  are accepted.
+- **`/projects none`** (or `off`/`clear`): clears the selection; the agent
+  falls back to `WORKSPACE`.
+- The active project is `chdir`'d into before every interactive request and
+  every task, and **persisted** in controller state so the choice survives
+  restarts. `TELEGRAM_AGENTKNIT_PROJECT` sets a default project at startup.
+- Selecting a different project drops the cached interactive runtimes so the
+  next request rebuilds its session in the new cwd (picking up the new
+  project's `AGENTS.md`).
+- **Per-task pinned project**: each task records the active project at creation
+  time, so switching projects later never moves a running task's files — the
+  task always runs in the project it was queued in. `/task detail` shows the
+  pinned project.
+- `/status` reports the active project (and its cwd).
+
+### 6. tmux integration
 
 - **`/tmux <text>`**: types the text + Enter into the configured tmux session,
   then a delayed screen capture (20 s, 30 lines) without blocking polling.
@@ -141,7 +172,7 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   - `list_tmux_windows(session=None)` — lists windows within a session.
   - `list_tmux_panes(window_target=None)` — lists panes within a window.
 
-### 6. System and miscellaneous commands
+### 7. System and miscellaneous commands
 
 - **`/restart`**: restarts the user systemd service
   `telegram-agentknit-controller.service`.
@@ -151,11 +182,12 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   Tasks, Agent, Restart, Help).
 - **One-letter shortcuts**: `h`=help, `s`=status, `v`=view screen, `i`=interrupt,
   `r`=restart, `t`=tasks (`t <prompt>` new task), `a`=agent (`a <key>` select),
-  `m <text>`=tmux, `x <cmd>`=shell, `c <prompt>`=agent.
+  `p`=projects (`p <name>` select), `m <text>`=tmux, `x <cmd>`=shell,
+  `c <prompt>`=agent.
 - **Inline buttons (callback queries)**: handled by `handle_callback()`, which
   acknowledges the query then reuses the same `handle()` dispatcher.
 
-### 7. Telegram API client
+### 8. Telegram API client
 
 - **Long-polling** (`getUpdates`, 30 s timeout); `allowed_updates` limited to
   `message` and `callback_query`.
@@ -164,7 +196,7 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
 - **Retry** on `409 Conflict`.
 - Reactions, typing indicators, inline keyboards, callback replies.
 
-### 8. Installation and systemd service
+### 9. Installation and systemd service
 
 - **`install.sh`**: prompts/secures `BOT_TOKEN`, generates `PAIR_CODE`,
   discovers executables, installs and starts the user service. Options:
@@ -181,6 +213,7 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
   - Agent registry configuration (spec files exist or model+endpoint set).
   - `tmux` binary availability on `PATH`.
   - Workspace directory existence.
+  - Discovered projects and the active project (if any).
   - tmux session availability (warning, not fatal).
   - Telegram bot API connectivity (`getMe`).
 - `loginctl enable-linger` for persistence after logout/reboot.
@@ -191,7 +224,7 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
     adaptable template for system-wide installation (requires editing
     `YOUR_USER` and paths).
 
-### 9. Configuration (environment variables)
+### 10. Configuration (environment variables)
 
 | Variable | Default | Role |
 | --- | --- | --- |
@@ -199,6 +232,7 @@ Inspired by [telegram-codex-controller](https://github.com/monperrus/telegram-co
 | `TELEGRAM_AGENTKNIT_STATE` | `~/.local/state/telegram-agentknit-control.json` | Pairing + Telegram offset state. |
 | `TELEGRAM_AGENTKNIT_TMUX_SESSION` | `web` | Target tmux session. |
 | `TELEGRAM_AGENTKNIT_WORKSPACE` | `~` | Working directory. |
+| `TELEGRAM_AGENTKNIT_PROJECT` | *(none)* | Default project selected at startup (folder name under `~`, `~/path`, or absolute path). |
 | `TELEGRAM_AGENTKNIT_SPEC` | *(none)* | Path to an agent spec JSON file (single-agent). |
 | `TELEGRAM_AGENTKNIT_MODEL` | *(none)* | Model name (with `ENDPOINT`). |
 | `TELEGRAM_AGENTKNIT_ENDPOINT` | *(none)* | Endpoint URL or `run://` binary path. |
